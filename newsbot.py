@@ -21,16 +21,17 @@ API_HASH = "your_api_hash_here"
 TARGET_CHANNEL = "YourChannelUsername" # Without the @
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
 
-SIMILARITY_THRESHOLD = 0.82
+# Hybrid AI Thresholds
+SIMILARITY_LOWER = 0.75  # Below this = Definitely New
+SIMILARITY_UPPER = 0.88  # Above this = Definitely Duplicate
+
 DB_FILE = "news_bot.db"
 DOWNLOAD_DIR = "downloads/"
 BACKUP_DIR = "backups/"
 
-# Ensure required directories exist
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO,
@@ -78,42 +79,59 @@ def init_ai():
     global normalizer, word_tokenize
     if 'normalizer' not in globals():
         from hazm import Normalizer, word_tokenize
-        logging.info("Loading Hazm NLP for Farsi text cleaning...")
         normalizer = Normalizer()
-        logging.info("Ready to use Google Gemini Cloud API for embeddings.")
 
 def process_text(text):
+    if not text: return ""
     text = re.sub(r'http\S+', '', text)
     text = re.sub(r'@\S+', '', text)
+    signature_patterns = [r'✍🏻.*', r'✍.*', r'🖊.*', r'منبع:.*', r'کانال.*']
+    for pattern in signature_patterns:
+        text = re.sub(pattern, '', text, flags=re.DOTALL)
     return normalizer.normalize(text).strip()
 
 def get_embedding(text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
+    payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
+    try:
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+        response.raise_for_status()
+        return response.json()['embedding']['values']
+    except Exception as e:
+        logging.error(f"Embedding API Error: {e}")
+        return None
+
+def ask_llm_if_duplicate(new_text, old_text):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    prompt = f"""You are a Farsi news analyst. Compare these two news posts. 
+    Are they reporting the exact same specific event/news? 
+    Reply strictly with 'YES' or 'NO'. Do not add any other words.
+    
+    Post 1: {old_text}
+    Post 2: {new_text}"""
+    
     payload = {
-        "model": "models/text-embedding-004",
-        "content": {"parts": [{"text": text}]}
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 5}
     }
-    headers = {"Content-Type": "application/json"}
     
     try:
-        response = requests.post(url, json=payload, headers=headers, timeout=10)
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
         response.raise_for_status()
-        data = response.json()
-        return data['embedding']['values']
+        answer = response.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
+        return "YES" in answer
     except Exception as e:
-        logging.error(f"Cloud API Error: {e}")
-        return None
+        logging.error(f"LLM API Error: {e}")
+        return False
 
 # ==========================================
 # 4. CORE DECISION ENGINE
 # ==========================================
 def analyze_and_decide(text, chat_username):
-    if not is_valid_news(text):
-        return {"type": "IGNORE"}
+    if not is_valid_news(text): return {"type": "IGNORE"}
         
     conn = get_db()
     c = conn.cursor()
-    
     c.execute("SELECT username FROM sources WHERE username = ?", (chat_username.lower(),))
     if not c.fetchone():
         conn.close()
@@ -135,24 +153,36 @@ def analyze_and_decide(text, chat_username):
     vector = np.array(raw_vector, dtype=np.float32)
     two_days_ago = (datetime.now() - timedelta(days=2)).timestamp()
     
-    c.execute("SELECT id, msg_id, vector, word_count FROM posts WHERE timestamp > ?", (two_days_ago,))
-    best_match = {"id": None, "msg_id": None, "score": 0, "words": 0}
+    c.execute("SELECT id, msg_id, text, vector, word_count FROM posts WHERE timestamp > ?", (two_days_ago,))
+    best_match = {"id": None, "msg_id": None, "text": "", "score": 0, "words": 0}
     
     for row in c.fetchall():
-        db_id, msg_id, db_vector_blob, db_word_count = row
+        db_id, msg_id, db_text, db_vector_blob, db_word_count = row
         db_vector = np.frombuffer(db_vector_blob, dtype=np.float32)
         score = cosine_similarity(vector, db_vector)
         
         if score > best_match["score"]:
-            best_match.update({"id": db_id, "msg_id": msg_id, "score": score, "words": db_word_count})
+            best_match.update({"id": db_id, "msg_id": msg_id, "text": db_text, "score": score, "words": db_word_count})
 
     action = {"type": "IGNORE"}
+    is_duplicate = False
 
-    if best_match["score"] >= SIMILARITY_THRESHOLD:
+    if best_match["score"] >= SIMILARITY_UPPER:
+        logging.info(f"Math certainty: EXACT match ({best_match['score']:.2f})")
+        is_duplicate = True
+    elif best_match["score"] >= SIMILARITY_LOWER:
+        logging.info(f"Math certainty: GRAY ZONE ({best_match['score']:.2f}). Asking LLM...")
+        is_duplicate = ask_llm_if_duplicate(clean_text, best_match["text"])
+        logging.info(f"LLM concluded duplicate: {is_duplicate}")
+    else:
+        logging.info(f"Math certainty: NEW post ({best_match['score']:.2f})")
+        is_duplicate = False
+
+    if is_duplicate:
         if word_count > best_match["words"]:
             action = {"type": "EDIT", "msg_id": best_match["msg_id"], "db_id": best_match["id"], "vector": vector, "words": word_count}
         else:
-            logging.info(f"Ignored duplicate redundant news. (Score: {best_match['score']:.2f}).")
+            logging.info("Ignored duplicate redundant news. Shorter or equal length.")
     else:
         action = {"type": "POST", "vector": vector, "words": word_count}
 
@@ -165,7 +195,6 @@ def analyze_and_decide(text, chat_username):
 def backup_system():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(BACKUP_DIR, f"newsbot_backup_{timestamp}.sqlite")
-    
     if os.path.exists(DB_FILE):
         shutil.copy2(DB_FILE, backup_file)
         print(f"\n[SUCCESS] Database backup saved to: {backup_file}")
@@ -183,18 +212,14 @@ def uninstall_app():
         print("[INFO] Stopping systemd service...")
         subprocess.run(["sudo", "systemctl", "stop", "newsbot"], stderr=subprocess.DEVNULL)
         subprocess.run(["sudo", "systemctl", "disable", "newsbot"], stderr=subprocess.DEVNULL)
-        
         service_path = "/etc/systemd/system/newsbot.service"
         if os.path.exists(service_path):
             subprocess.run(["sudo", "rm", service_path])
             subprocess.run(["sudo", "systemctl", "daemon-reload"])
-            
         cmd_path = "/usr/local/bin/newsbot"
         if os.path.exists(cmd_path):
             subprocess.run(["sudo", "rm", cmd_path])
-
         print("\n[SUCCESS] Systemd service and CLI command uninstalled.")
-        print("Note: Your project directory (~/telegram_news_bot) was kept safe. You can remove it manually if desired.")
         sys.exit(0)
 
 # ==========================================
@@ -223,24 +248,20 @@ def interactive_menu():
         print("==============================================")
         
         choice = input("Select an option [0-12]: ").strip()
-        
-        if choice == "1":
-            subprocess.run(["sudo", "systemctl", "status", "newsbot"])
-        elif choice == "2":
+        if choice == "1": subprocess.run(["sudo", "systemctl", "status", "newsbot"])
+        elif choice == "2": 
             subprocess.run(["sudo", "systemctl", "start", "newsbot"])
             print("[INFO] Service started.")
-        elif choice == "3":
+        elif choice == "3": 
             subprocess.run(["sudo", "systemctl", "stop", "newsbot"])
             print("[INFO] Service stopped.")
-        elif choice == "4":
+        elif choice == "4": 
             subprocess.run(["sudo", "systemctl", "restart", "newsbot"])
             print("[INFO] Service restarted.")
         elif choice == "5":
             print("\n--- Press Ctrl+C to exit logs ---")
-            try:
-                subprocess.run(["tail", "-f", "bot.log"])
-            except KeyboardInterrupt:
-                pass
+            try: subprocess.run(["tail", "-f", "bot.log"])
+            except KeyboardInterrupt: pass
         elif choice == "6":
             ch = input("Enter channel username (without @): ").strip()
             if ch:
@@ -263,24 +284,16 @@ def interactive_menu():
         elif choice == "8":
             conn = get_db()
             print("\n--- Monitored Channels ---")
-            for row in conn.execute("SELECT username FROM sources").fetchall():
-                print(f" - @{row[0]}")
+            for row in conn.execute("SELECT username FROM sources").fetchall(): print(f" - @{row[0]}")
             conn.close()
         elif choice == "9":
             kw = input("Enter keyword to search (e.g., اخبار): ").strip()
-            if kw:
-                subprocess.run([sys.executable, __file__, "search", "--keyword", kw])
-        elif choice == "10":
-            backup_system()
-        elif choice == "11":
-            update_dependencies()
-        elif choice == "12":
-            uninstall_app()
-        elif choice == "0":
-            print("Goodbye!")
-            break
-        else:
-            print("[ERROR] Invalid selection, try again.")
+            if kw: subprocess.run([sys.executable, __file__, "search", "--keyword", kw])
+        elif choice == "10": backup_system()
+        elif choice == "11": update_dependencies()
+        elif choice == "12": uninstall_app()
+        elif choice == "0": break
+        else: print("[ERROR] Invalid selection, try again.")
 
 # ==========================================
 # 7. MAIN ENTRYPOINT
@@ -289,15 +302,12 @@ def main():
     init_db()
     parser = argparse.ArgumentParser(description="Telegram AI News Bot CLI")
     parser.add_argument("command", nargs="?", default="menu", 
-                        choices=["menu", "login", "run", "add", "remove", "list", "search", "backup"], 
-                        help="Command to execute")
-    parser.add_argument("--channel", type=str, help="Channel username (without @)")
-    parser.add_argument("--keyword", type=str, help="Keyword for auto-search")
-    
+                        choices=["menu", "login", "run", "add", "remove", "list", "search", "backup"])
+    parser.add_argument("--channel", type=str)
+    parser.add_argument("--keyword", type=str)
     args = parser.parse_args()
 
-    if args.command == "menu":
-        interactive_menu()
+    if args.command == "menu": interactive_menu()
 
     elif args.command == "login":
         print("\n--- Initializing Telegram Login ---")
@@ -307,8 +317,7 @@ def main():
         client.disconnect()
 
     elif args.command == "search":
-        if not args.keyword:
-            return print("Error: Provide a keyword using --keyword")
+        if not args.keyword: return print("Error: Provide a keyword using --keyword")
         async def do_search():
             await client.connect()
             result = await client(SearchRequest(q=args.keyword, limit=5))
@@ -332,42 +341,50 @@ def main():
 
         @client.on(events.NewMessage)
         async def news_handler(event):
-            text = event.message.text or event.message.caption
-            if not text: return
+            # 1. PAUSE FOR MEDIA: Wait 3 seconds for heavy files or late attachments
+            await asyncio.sleep(3)
             
             chat = await event.get_chat()
             chat_username = getattr(chat, 'username', None)
             if not chat_username: return
 
-            action = await asyncio.to_thread(analyze_and_decide, text, chat_username)
+            # 2. RE-FETCH: Get the absolute latest version of the message after the pause
+            message = await client.get_messages(chat, ids=event.id)
+            if not message: return
+
+            raw_text = message.text or message.caption
+            if not raw_text: return
+
+            action = await asyncio.to_thread(analyze_and_decide, raw_text, chat_username)
             if action["type"] == "IGNORE": return
 
+            cleaned_post_text = process_text(raw_text)
+            if not cleaned_post_text: return
+
+            # 3. DOWNLOAD UPDATED MEDIA: Extracts photos, videos, or gifs
             media_path = None
             try:
-                if event.message.photo:
-                    media_path = await event.message.download_media(file=DOWNLOAD_DIR)
-                elif event.message.media and hasattr(event.message.media, 'webpage'):
-                    pass 
+                if message.photo or message.video or getattr(message, 'gif', False):
+                    media_path = await message.download_media(file=DOWNLOAD_DIR)
             except Exception as med_err:
                 logging.warning(f"Could not download media: {med_err}")
 
             char_limit = 1000 if media_path else 4090
-            safe_text = text[:char_limit] + "..." if len(text) > char_limit else text
+            safe_text = cleaned_post_text[:char_limit] + "..." if len(cleaned_post_text) > char_limit else cleaned_post_text
 
             conn = get_db()
-
             try:
                 if action["type"] == "POST":
                     msg = await client.send_message(TARGET_CHANNEL, safe_text, file=media_path)
                     conn.execute("INSERT INTO posts (msg_id, text, vector, word_count, timestamp) VALUES (?, ?, ?, ?, ?)",
                               (msg.id, safe_text, action["vector"].tobytes(), action["words"], datetime.now().timestamp()))
-                    logging.info(f"POSTED new news (Has Photo: {bool(media_path)}) from @{chat_username}")
+                    logging.info(f"POSTED new news (Media: {bool(media_path)}) from @{chat_username}")
                         
                 elif action["type"] == "EDIT":
                     await client.edit_message(TARGET_CHANNEL, action["msg_id"], safe_text, file=media_path)
                     conn.execute("UPDATE posts SET text=?, vector=?, word_count=?, timestamp=? WHERE id=?", 
                               (safe_text, action["vector"].tobytes(), action["words"], datetime.now().timestamp(), action["db_id"]))
-                    logging.info(f"EDITED message {action['msg_id']} with better text (Has Photo: {bool(media_path)})")
+                    logging.info(f"EDITED message {action['msg_id']} with better text (Media: {bool(media_path)})")
                 
                 conn.commit()
             except Exception as e:
@@ -377,7 +394,7 @@ def main():
                 if media_path and os.path.exists(media_path):
                     os.remove(media_path)
 
-        logging.info("Bot is listening for news and photos...")
+        logging.info("Bot is listening for news (Hybrid AI Active, 3s Media Sync, Signature Stripping)...")
         client.start()
         client.run_until_disconnected()
 
