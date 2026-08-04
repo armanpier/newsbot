@@ -77,7 +77,7 @@ Clone the repository:
 
 ```bash
 git clone https://github.com/armanpier/newsbot.git
-cd telegram-news-bot
+cd newsbot
 ```
 
 
