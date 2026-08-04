@@ -37,7 +37,7 @@ To run a Telegram userbot, you need a pair of API credentials from Telegram:
 Log into your Ubuntu/Linux VPS via SSH and run the installation script:
 
 ```bash
-git clone [https://github.com/YOUR_USERNAME/telegram-news-bot.git](https://github.com/YOUR_USERNAME/telegram-news-bot.git) /root/telegram_news_bot
+git clone [https://github.com/armanpier/telegram-news-bot.git](https://github.com/armanpier/telegram-news-bot.git) /root/telegram_news_bot
 cd /root/telegram_news_bot
 chmod +x install.sh
 ./install.sh
