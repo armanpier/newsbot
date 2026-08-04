@@ -15,8 +15,9 @@ An automated, intelligent Farsi news aggregator and filter built in Python. It m
 
 ---
 
-## 🔑 Step 1: How to Get Your Telegram API ID and API Hash
+## 🛠️ Step-by-Step Setup Guide
 
+### Step 1: Get Your Telegram API Credentials
 To run a Telegram userbot, you need a pair of API credentials from Telegram:
 
 1. Open your browser and go to [my.telegram.org](https://my.telegram.org).
@@ -28,36 +29,26 @@ To run a Telegram userbot, you need a pair of API credentials from Telegram:
    * **Short name**: Give it a short identifier (e.g., `mynewsbot`).
    * **Platform**: Select **Desktop**.
 6. Click **Create application**.
-7. Copy your **`api_id`** (a string of numbers) and **`api_hash`** (a long alphanumeric string) to use during installation.
+7. Copy your **`api_id`** (a string of numbers) and **`api_hash`** (a long alphanumeric string) to a safe place.
+
+### Step 2: Get Your Google Gemini API Key
+Because this bot uses Google's AI to compare news and filter duplicates, you will need a free API key:
+
+1. Go to Google AI Studio at [aistudio.google.com](https://aistudio.google.com/).
+2. Sign in with your Google account.
+3. Click **Get API key** in the left menu.
+4. Create a new key and copy it to a safe place.
 
 ---
 
-## 🚀 Step 2: One-Line Automated Installation on Linux (VPS)
+### Step 3: Installation
 
-Log into your Ubuntu/Linux VPS via SSH and run the installation script:
+Choose **ONE** of the installation methods below. (If you are unsure, use Option B).
 
+#### Option A: One-Line Automated Installation (Linux/VPS)
+If you are using an Ubuntu/Linux VPS, you can use the automated script:
 ```bash
-git clone [https://github.com/armanpier/telegram-news-bot.git](https://github.com/armanpier/telegram-news-bot.git) /root/telegram_news_bot
-cd /root/telegram_news_bot
+git clone [https://github.com/armanpier/telegram-news-bot.git](https://github.com/armanpier/telegram-news-bot.git) ~/telegram_news_bot
+cd ~/telegram_news_bot
 chmod +x install.sh
 ./install.sh
-
-
-## 🛠️ Installation
-
-**1. Clone the repository:**
-\`\`\`bash
-git clone https://github.com/YourUsername/YourRepoName.git
-cd YourRepoName
-\`\`\`
-
-**2. Create and activate a virtual environment:**
-\`\`\`bash
-python3 -m venv venv
-source venv/bin/activate
-\`\`\`
-
-**3. Install dependencies from the requirements file:**
-\`\`\`bash
-pip install -r requirements.txt
-\`\`\`
