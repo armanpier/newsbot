@@ -15,12 +15,12 @@ from telethon import TelegramClient, events
 from telethon.tl.functions.contacts import SearchRequest
 
 # ==========================================
-# 1. CONFIGURATION (EDIT THESE BEFORE RUNNING)
+# 1. CONFIGURATION (EDIT THESE)
 # ==========================================
-API_ID = 1234567 
-API_HASH = "your_api_hash_here" 
-TARGET_CHANNEL = "YourChannelUsername" # Without the @
-GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+API_ID = 1234567                     # Your numeric Telegram API_ID
+API_HASH = "your_api_hash_here"      # Your Telegram API_HASH string
+TARGET_CHANNEL = "YourChannelUsername" # Target Telegram channel (WITHOUT @)
+GEMINI_API_KEY = "YOUR_GEMINI_KEY"    # Your Google Gemini API Key
 
 # Hybrid AI Thresholds
 SIMILARITY_LOWER = 0.75  # Below this = Definitely New
