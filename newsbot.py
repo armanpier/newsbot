@@ -9,12 +9,13 @@ import shutil
 import subprocess
 import numpy as np
 import requests
+import time
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.tl.functions.contacts import SearchRequest
 
 # ==========================================
-# 1. CONFIGURATION (EDIT THESE)
+# 1. CONFIGURATION (EDIT THESE BEFORE RUNNING)
 # ==========================================
 API_ID = 1234567 
 API_HASH = "your_api_hash_here" 
@@ -61,17 +62,27 @@ def cosine_similarity(v1, v2):
 # 3. SPAM FILTER, AI & NLP
 # ==========================================
 AD_ADMIN_KEYWORDS = [
+    # General Ads
     "تبلیغات", "جهت رزرو", "پست موقت", "عضو شوید", "لینک زیر", 
     "کلیک کنید", "joinchat", "t.me/+", "خرید و فروش", "اسپانسر",
     "ارتباط با ما", "ارتباط با ادمین", "تخفیف ویژه", "هم اکنون بپیوندید",
     "ثبت سفارش", "فروش ویژه", "قیمت استثنایی", "ادمین", "تبادل",
-    "کانال در حال بروزرسانی", "رزرو تبلیغ"
+    "کانال در حال بروزرسانی", "رزرو تبلیغ",
+    
+    # VPN, Proxy & Config Ads
+    "کانفیگ", "vpn", "وی پی ان", "فیلترشکن", "فیلتر شکن", 
+    "پروکسی", "خرید و تحویل", "v2ray", "پلن‌ها", "کاربر نامحدود", 
+    "سرعت بالا", "تست رایگان"
 ]
 
 def is_valid_news(text):
     if not text: return False
+    
+    # Convert text to lowercase to make it case-insensitive
+    text_lower = text.lower()
+    
     for keyword in AD_ADMIN_KEYWORDS:
-        if keyword in text:
+        if keyword.lower() in text_lower:
             return False
     return True
 
@@ -85,6 +96,7 @@ def process_text(text):
     if not text: return ""
     text = re.sub(r'http\S+', '', text)
     text = re.sub(r'@\S+', '', text)
+    # Strip common signature indicators
     signature_patterns = [r'✍🏻.*', r'✍.*', r'🖊.*', r'منبع:.*', r'کانال.*']
     for pattern in signature_patterns:
         text = re.sub(pattern, '', text, flags=re.DOTALL)
@@ -101,7 +113,7 @@ def get_embedding(text):
         logging.error(f"Embedding API Error: {e}")
         return None
 
-def ask_llm_if_duplicate(new_text, old_text):
+def ask_llm_if_duplicate(new_text, old_text, retries=3):
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""You are a Farsi news analyst. Compare these two news posts. 
     Are they reporting the exact same specific event/news? 
@@ -115,14 +127,28 @@ def ask_llm_if_duplicate(new_text, old_text):
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 5}
     }
     
-    try:
-        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
-        response.raise_for_status()
-        answer = response.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-        return "YES" in answer
-    except Exception as e:
-        logging.error(f"LLM API Error: {e}")
-        return False
+    for attempt in range(retries):
+        try:
+            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
+            response.raise_for_status() 
+            
+            answer = response.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
+            return "YES" in answer
+            
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 429:
+                wait_time = 2 ** attempt # Exponential backoff: 1s, 2s, 4s
+                logging.warning(f"LLM Rate Limit Hit (429). Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logging.error(f"LLM API HTTP Error: {e}")
+                return False
+        except Exception as e:
+            logging.error(f"LLM API Error: {e}")
+            return False
+            
+    logging.error("LLM API failed after maximum retries. Defaulting to completely new news.")
+    return False
 
 # ==========================================
 # 4. CORE DECISION ENGINE
@@ -190,7 +216,7 @@ def analyze_and_decide(text, chat_username):
     return action
 
 # ==========================================
-# 5. ADMINISTRATIVE TOOLS (Backups & Management)
+# 5. ADMINISTRATIVE TOOLS
 # ==========================================
 def backup_system():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -352,7 +378,7 @@ def main():
             message = await client.get_messages(chat, ids=event.id)
             if not message: return
 
-            raw_text = message.text or message.caption
+            raw_text = message.text
             if not raw_text: return
 
             action = await asyncio.to_thread(analyze_and_decide, raw_text, chat_username)
@@ -369,8 +395,14 @@ def main():
             except Exception as med_err:
                 logging.warning(f"Could not download media: {med_err}")
 
-            char_limit = 1000 if media_path else 4090
-            safe_text = cleaned_post_text[:char_limit] + "..." if len(cleaned_post_text) > char_limit else cleaned_post_text
+            safe_text = cleaned_post_text[:4090] + "..." if len(cleaned_post_text) > 4090 else cleaned_post_text
+
+            # --- NEW LOGIC: DROP MEDIA IF TEXT IS TOO LONG ---
+            if media_path and len(safe_text) > 1000:
+                logging.info(f"Text exceeds 1000 characters ({len(safe_text)}). Dropping media to keep as a single text post.")
+                if os.path.exists(media_path):
+                    os.remove(media_path)
+                media_path = None
 
             conn = get_db()
             try:
