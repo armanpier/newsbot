@@ -91,7 +91,7 @@ def process_text(text):
     return normalizer.normalize(text).strip()
 
 def get_embedding(text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
     payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
     try:
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
@@ -102,7 +102,7 @@ def get_embedding(text):
         return None
 
 def ask_llm_if_duplicate(new_text, old_text):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""You are a Farsi news analyst. Compare these two news posts. 
     Are they reporting the exact same specific event/news? 
     Reply strictly with 'YES' or 'NO'. Do not add any other words.
