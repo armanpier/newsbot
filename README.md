@@ -76,7 +76,7 @@ sudo apt install git python3 python3-pip python3-venv sqlite3 -y
 Clone the repository:
 
 ```bash
-git clone https://github.com/armanpier/telegram-news-bot.git
+git clone https://github.com/armanpier/newsbot.git
 cd telegram-news-bot
 ```
 
