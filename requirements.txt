@@ -1,0 +1,5 @@
+telethon
+hazm
+numpy
+requests
+nltk==3.9.4
