@@ -9,22 +9,28 @@ import shutil
 import subprocess
 import numpy as np
 import requests
-import time
 from datetime import datetime, timedelta
 from telethon import TelegramClient, events
 from telethon.tl.functions.contacts import SearchRequest
 
 # ==========================================
-# 1. CONFIGURATION (EDIT THESE)
+# 1. CONFIGURATION (ENV VARS WITH FALLBACKS)
 # ==========================================
-API_ID = 1234567                     # Your numeric Telegram API_ID
-API_HASH = "your_api_hash_here"      # Your Telegram API_HASH string
-TARGET_CHANNEL = "YourChannelUsername" # Target Telegram channel (WITHOUT @)
-GEMINI_API_KEY = "YOUR_GEMINI_KEY"    # Your Google Gemini API Key
+# Credentials fetched safely from environment or defaults
+API_ID = int(os.getenv("TELEGRAM_API_ID", 1234567))
+API_HASH = os.getenv("TELEGRAM_API_HASH", "YOUR_TELEGRAM_API_HASH")
+TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "your_target_channel")  # Without the @
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 
-# Hybrid AI Thresholds
-SIMILARITY_LOWER = 0.75  # Below this = Definitely New
-SIMILARITY_UPPER = 0.88  # Above this = Definitely Duplicate
+# Set to True to completely bypass Gemini API and use local TF-IDF hashing
+USE_LOCAL_ONLY = os.getenv("USE_LOCAL_ONLY", "True").lower() == "true"
+
+# Fixed vector dimension for local hashing (prevents RAM leaks)
+HASH_VECTOR_SIZE = 1000  
+
+# Similarity Thresholds
+SIMILARITY_LOWER = 0.55  
+SIMILARITY_UPPER = 0.82  
 
 DB_FILE = "news_bot.db"
 DOWNLOAD_DIR = "downloads/"
@@ -40,7 +46,7 @@ logging.basicConfig(
 )
 
 # ==========================================
-# 2. INITIALIZATION & DATABASE
+# 2. INITIALIZATION & DATABASE OPTIMIZATIONS
 # ==========================================
 def get_db():
     return sqlite3.connect(DB_FILE, timeout=15.0)
@@ -52,24 +58,28 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS posts 
                  (id INTEGER PRIMARY KEY, msg_id INTEGER, text TEXT, 
                  vector BLOB, word_count INTEGER, timestamp REAL)''')
+    
+    # Index on timestamp to eliminate CPU table scans
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_posts_timestamp ON posts(timestamp)''')
     conn.commit()
     conn.close()
 
 def cosine_similarity(v1, v2):
-    return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 == 0 or norm2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (norm1 * norm2))
 
 # ==========================================
-# 3. SPAM FILTER, AI & NLP
+# 3. SPAM FILTER, NLP & HASHING VECTORIZER
 # ==========================================
 AD_ADMIN_KEYWORDS = [
-    # General Ads
     "تبلیغات", "جهت رزرو", "پست موقت", "عضو شوید", "لینک زیر", 
     "کلیک کنید", "joinchat", "t.me/+", "خرید و فروش", "اسپانسر",
     "ارتباط با ما", "ارتباط با ادمین", "تخفیف ویژه", "هم اکنون بپیوندید",
     "ثبت سفارش", "فروش ویژه", "قیمت استثنایی", "ادمین", "تبادل",
     "کانال در حال بروزرسانی", "رزرو تبلیغ",
-    
-    # VPN, Proxy & Config Ads
     "کانفیگ", "vpn", "وی پی ان", "فیلترشکن", "فیلتر شکن", 
     "پروکسی", "خرید و تحویل", "v2ray", "پلن‌ها", "کاربر نامحدود", 
     "سرعت بالا", "تست رایگان"
@@ -77,10 +87,7 @@ AD_ADMIN_KEYWORDS = [
 
 def is_valid_news(text):
     if not text: return False
-    
-    # Convert text to lowercase to make it case-insensitive
     text_lower = text.lower()
-    
     for keyword in AD_ADMIN_KEYWORDS:
         if keyword.lower() in text_lower:
             return False
@@ -96,24 +103,40 @@ def process_text(text):
     if not text: return ""
     text = re.sub(r'http\S+', '', text)
     text = re.sub(r'@\S+', '', text)
-    # Strip common signature indicators
     signature_patterns = [r'✍🏻.*', r'✍.*', r'🖊.*', r'منبع:.*', r'کانال.*']
     for pattern in signature_patterns:
         text = re.sub(pattern, '', text, flags=re.DOTALL)
     return normalizer.normalize(text).strip()
 
+def get_hashing_embedding(tokens):
+    """
+    Fixed-size Hashing Trick (O(1) memory).
+    Replaces dynamic vocabulary allocation to permanently fix RAM leaks.
+    """
+    vec = np.zeros(HASH_VECTOR_SIZE, dtype=np.float32)
+    for token in tokens:
+        idx = hash(token) % HASH_VECTOR_SIZE
+        vec[idx] += 1.0
+    return vec
+
 def get_embedding(text):
+    if USE_LOCAL_ONLY:
+        return None
+
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-embedding-001:embedContent?key={GEMINI_API_KEY}"
     payload = {"model": "models/gemini-embedding-001", "content": {"parts": [{"text": text}]}}
     try:
-        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=8)
         response.raise_for_status()
         return response.json()['embedding']['values']
     except Exception as e:
-        logging.error(f"Embedding API Error: {e}")
+        logging.warning(f"Gemini API Error: {e}. Falling back to local hashing engine.")
         return None
 
-def ask_llm_if_duplicate(new_text, old_text, retries=3):
+def ask_llm_if_duplicate(new_text, old_text):
+    if USE_LOCAL_ONLY:
+        return False
+
     url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""You are a Farsi news analyst. Compare these two news posts. 
     Are they reporting the exact same specific event/news? 
@@ -127,31 +150,17 @@ def ask_llm_if_duplicate(new_text, old_text, retries=3):
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 5}
     }
     
-    for attempt in range(retries):
-        try:
-            response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=15)
-            response.raise_for_status() 
-            
-            answer = response.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
-            return "YES" in answer
-            
-        except requests.exceptions.HTTPError as e:
-            if response.status_code == 429:
-                wait_time = 2 ** attempt # Exponential backoff: 1s, 2s, 4s
-                logging.warning(f"LLM Rate Limit Hit (429). Retrying in {wait_time} seconds...")
-                time.sleep(wait_time)
-            else:
-                logging.error(f"LLM API HTTP Error: {e}")
-                return False
-        except Exception as e:
-            logging.error(f"LLM API Error: {e}")
-            return False
-            
-    logging.error("LLM API failed after maximum retries. Defaulting to completely new news.")
-    return False
+    try:
+        response = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=10)
+        response.raise_for_status()
+        answer = response.json()['candidates'][0]['content']['parts'][0]['text'].strip().upper()
+        return "YES" in answer
+    except Exception as e:
+        logging.warning(f"LLM API Error: {e}. Defaulting to non-duplicate.")
+        return False
 
 # ==========================================
-# 4. CORE DECISION ENGINE
+# 4. OPTIMIZED DECISION ENGINE
 # ==========================================
 def analyze_and_decide(text, chat_username):
     if not is_valid_news(text): return {"type": "IGNORE"}
@@ -171,37 +180,56 @@ def analyze_and_decide(text, chat_username):
         conn.close()
         return {"type": "IGNORE"}
 
-    raw_vector = get_embedding(clean_text)
-    if not raw_vector:
-        conn.close()
-        return {"type": "IGNORE"}
-        
-    vector = np.array(raw_vector, dtype=np.float32)
+    # Limit comparative query to last 48h AND max 200 posts to bound RAM/CPU
     two_days_ago = (datetime.now() - timedelta(days=2)).timestamp()
-    
-    c.execute("SELECT id, msg_id, text, vector, word_count FROM posts WHERE timestamp > ?", (two_days_ago,))
+    c.execute(
+        "SELECT id, msg_id, text, vector, word_count FROM posts WHERE timestamp > ? ORDER BY id DESC LIMIT 200", 
+        (two_days_ago,)
+    )
+    recent_posts = c.fetchall()
+
+    raw_vector = get_embedding(clean_text)
     best_match = {"id": None, "msg_id": None, "text": "", "score": 0, "words": 0}
-    
-    for row in c.fetchall():
-        db_id, msg_id, db_text, db_vector_blob, db_word_count = row
-        db_vector = np.frombuffer(db_vector_blob, dtype=np.float32)
-        score = cosine_similarity(vector, db_vector)
-        
-        if score > best_match["score"]:
-            best_match.update({"id": db_id, "msg_id": msg_id, "text": db_text, "score": score, "words": db_word_count})
+
+    # API MODE (Gemini Embeddings)
+    if raw_vector is not None:
+        vector = np.array(raw_vector, dtype=np.float32)
+        for row in recent_posts:
+            db_id, msg_id, db_text, db_vector_blob, db_word_count = row
+            db_vector = np.frombuffer(db_vector_blob, dtype=np.float32)
+            
+            if db_vector.shape == vector.shape:
+                score = cosine_similarity(vector, db_vector)
+                if score > best_match["score"]:
+                    best_match.update({"id": db_id, "msg_id": msg_id, "text": db_text, "score": score, "words": db_word_count})
+
+    # LOCAL HASHING ENGINE (Ultra Fast & Zero-Leak)
+    else:
+        vector = get_hashing_embedding(words)
+        for row in recent_posts:
+            db_id, msg_id, db_text, db_vector_blob, db_word_count = row
+            db_vector = np.frombuffer(db_vector_blob, dtype=np.float32)
+
+            if db_vector.shape == vector.shape:
+                score = cosine_similarity(vector, db_vector)
+                if score > best_match["score"]:
+                    best_match.update({"id": db_id, "msg_id": msg_id, "text": db_text, "score": score, "words": db_word_count})
 
     action = {"type": "IGNORE"}
     is_duplicate = False
 
     if best_match["score"] >= SIMILARITY_UPPER:
-        logging.info(f"Math certainty: EXACT match ({best_match['score']:.2f})")
+        logging.info(f"Certainty: EXACT match ({best_match['score']:.2f})")
         is_duplicate = True
     elif best_match["score"] >= SIMILARITY_LOWER:
-        logging.info(f"Math certainty: GRAY ZONE ({best_match['score']:.2f}). Asking LLM...")
-        is_duplicate = ask_llm_if_duplicate(clean_text, best_match["text"])
-        logging.info(f"LLM concluded duplicate: {is_duplicate}")
+        if not USE_LOCAL_ONLY:
+            logging.info(f"Certainty: GRAY ZONE ({best_match['score']:.2f}). Asking LLM...")
+            is_duplicate = ask_llm_if_duplicate(clean_text, best_match["text"])
+        else:
+            logging.info(f"Local Engine match ({best_match['score']:.2f}) -> duplicate detected.")
+            is_duplicate = True
     else:
-        logging.info(f"Math certainty: NEW post ({best_match['score']:.2f})")
+        logging.info(f"Certainty: NEW post ({best_match['score']:.2f})")
         is_duplicate = False
 
     if is_duplicate:
@@ -216,8 +244,14 @@ def analyze_and_decide(text, chat_username):
     return action
 
 # ==========================================
-# 5. ADMINISTRATIVE TOOLS
+# 5. ADMINISTRATIVE TOOLS & BACKUPS
 # ==========================================
+def toggle_engine():
+    global USE_LOCAL_ONLY
+    USE_LOCAL_ONLY = not USE_LOCAL_ONLY
+    status = "LOCAL (Hashing Vectorizer)" if USE_LOCAL_ONLY else "AI (Google Gemini)"
+    print(f"\n[SUCCESS] Engine mode switched to: {status}")
+
 def backup_system():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_file = os.path.join(BACKUP_DIR, f"newsbot_backup_{timestamp}.sqlite")
@@ -226,6 +260,39 @@ def backup_system():
         print(f"\n[SUCCESS] Database backup saved to: {backup_file}")
     else:
         print("\n[ERROR] No database file found to backup.")
+
+def restore_system():
+    if not os.path.exists(BACKUP_DIR):
+        print("\n[ERROR] No backup directory found.")
+        return
+
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".sqlite")], reverse=True)
+    if not backups:
+        print("\n[ERROR] No sqlite backup files found in backups/")
+        return
+
+    print("\n--- Available Database Backups ---")
+    for idx, filename in enumerate(backups, 1):
+        filepath = os.path.join(BACKUP_DIR, filename)
+        mtime = datetime.fromtimestamp(os.path.getmtime(filepath)).strftime("%Y-%m-%d %H:%M:%S")
+        print(f" [{idx}] {filename} (Created: {mtime})")
+
+    choice = input(f"\nSelect a backup to restore [1-{len(backups)}] (or 0 to cancel): ").strip()
+    if not choice.isdigit() or int(choice) < 1 or int(choice) > len(backups):
+        print("[INFO] Restore canceled.")
+        return
+
+    selected_backup = os.path.join(BACKUP_DIR, backups[int(choice) - 1])
+    confirm = input(f"[WARNING] Overwrite active database with '{backups[int(choice) - 1]}'? (y/N): ").strip()
+    
+    if confirm.lower() == 'y':
+        if os.path.exists(DB_FILE):
+            safety_file = os.path.join(BACKUP_DIR, f"pre_restore_safety_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite")
+            shutil.copy2(DB_FILE, safety_file)
+            print(f"[INFO] Created safety snapshot of current DB at: {safety_file}")
+
+        shutil.copy2(selected_backup, DB_FILE)
+        print(f"[SUCCESS] Database successfully restored from {selected_backup}")
 
 def update_dependencies():
     print("\n[INFO] Updating Python dependencies...")
@@ -253,9 +320,12 @@ def uninstall_app():
 # ==========================================
 def interactive_menu():
     while True:
+        engine_str = "🖥️ Local Hashing Vectorizer" if USE_LOCAL_ONLY else "🧠 Gemini AI"
         print("\n==============================================")
         print("           📰 TELEGRAM NEWS BOT MENU           ")
         print("==============================================")
+        print(f" Current Engine: {engine_str}")
+        print("----------------------------------------------")
         print(" [1]  📊 Check Service Status")
         print(" [2]  ▶️  Start Background Daemon")
         print(" [3]  ⏹️  Stop Background Daemon")
@@ -268,12 +338,14 @@ def interactive_menu():
         print(" [9]  🔍 Search Telegram for Channels")
         print("----------------------------------------------")
         print(" [10] 💾 Backup Database")
-        print(" [11] 📦 Update Dependencies")
-        print(" [12] ⚠️  Uninstall System Service")
+        print(" [11] ♻️  Restore Database Backup")
+        print(" [12] ⚙️  Toggle Processing Engine (AI / Local)")
+        print(" [13] 📦 Update Dependencies")
+        print(" [14] ⚠️  Uninstall System Service")
         print(" [0]  ❌ Exit")
         print("==============================================")
         
-        choice = input("Select an option [0-12]: ").strip()
+        choice = input("Select an option [0-14]: ").strip()
         if choice == "1": subprocess.run(["sudo", "systemctl", "status", "newsbot"])
         elif choice == "2": 
             subprocess.run(["sudo", "systemctl", "start", "newsbot"])
@@ -316,8 +388,10 @@ def interactive_menu():
             kw = input("Enter keyword to search (e.g., اخبار): ").strip()
             if kw: subprocess.run([sys.executable, __file__, "search", "--keyword", kw])
         elif choice == "10": backup_system()
-        elif choice == "11": update_dependencies()
-        elif choice == "12": uninstall_app()
+        elif choice == "11": restore_system()
+        elif choice == "12": toggle_engine()
+        elif choice == "13": update_dependencies()
+        elif choice == "14": uninstall_app()
         elif choice == "0": break
         else: print("[ERROR] Invalid selection, try again.")
 
@@ -328,7 +402,7 @@ def main():
     init_db()
     parser = argparse.ArgumentParser(description="Telegram AI News Bot CLI")
     parser.add_argument("command", nargs="?", default="menu", 
-                        choices=["menu", "login", "run", "add", "remove", "list", "search", "backup"])
+                        choices=["menu", "login", "run", "add", "remove", "list", "search", "backup", "restore"])
     parser.add_argument("--channel", type=str)
     parser.add_argument("--keyword", type=str)
     args = parser.parse_args()
@@ -367,18 +441,16 @@ def main():
 
         @client.on(events.NewMessage)
         async def news_handler(event):
-            # 1. PAUSE FOR MEDIA: Wait 3 seconds for heavy files or late attachments
             await asyncio.sleep(3)
             
             chat = await event.get_chat()
             chat_username = getattr(chat, 'username', None)
             if not chat_username: return
 
-            # 2. RE-FETCH: Get the absolute latest version of the message after the pause
             message = await client.get_messages(chat, ids=event.id)
             if not message: return
 
-            raw_text = message.text
+            raw_text = message.text or message.caption
             if not raw_text: return
 
             action = await asyncio.to_thread(analyze_and_decide, raw_text, chat_username)
@@ -387,7 +459,6 @@ def main():
             cleaned_post_text = process_text(raw_text)
             if not cleaned_post_text: return
 
-            # 3. DOWNLOAD UPDATED MEDIA: Extracts photos, videos, or gifs
             media_path = None
             try:
                 if message.photo or message.video or getattr(message, 'gif', False):
@@ -395,14 +466,8 @@ def main():
             except Exception as med_err:
                 logging.warning(f"Could not download media: {med_err}")
 
-            safe_text = cleaned_post_text[:4090] + "..." if len(cleaned_post_text) > 4090 else cleaned_post_text
-
-            # --- NEW LOGIC: DROP MEDIA IF TEXT IS TOO LONG ---
-            if media_path and len(safe_text) > 1000:
-                logging.info(f"Text exceeds 1000 characters ({len(safe_text)}). Dropping media to keep as a single text post.")
-                if os.path.exists(media_path):
-                    os.remove(media_path)
-                media_path = None
+            char_limit = 1000 if media_path else 4090
+            safe_text = cleaned_post_text[:char_limit] + "..." if len(cleaned_post_text) > char_limit else cleaned_post_text
 
             conn = get_db()
             try:
@@ -426,12 +491,16 @@ def main():
                 if media_path and os.path.exists(media_path):
                     os.remove(media_path)
 
-        logging.info("Bot is listening for news (Hybrid AI Active, 3s Media Sync, Signature Stripping)...")
+        engine_status = "Local Hashing Vectorizer" if USE_LOCAL_ONLY else "Google Gemini AI Mode"
+        logging.info(f"Bot listening for news (Engine: {engine_status}, 3s Media Sync, Signature Stripping)...")
         client.start()
         client.run_until_disconnected()
 
     elif args.command == "backup":
         backup_system()
+
+    elif args.command == "restore":
+        restore_system()
 
 if __name__ == '__main__':
     main()
